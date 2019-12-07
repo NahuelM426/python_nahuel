@@ -62,7 +62,8 @@ class IoDeviceController():
     def runOperation(self, pcb, instruction):
         pair = {'pcb': pcb, 'instruction': instruction}
         pcb.state = WAITING
-        if self._device.is_idle : 
+        
+        if HARDWARE.ioDevice.is_idle : 
             self._device.execute(instruction)
             self._currentPCB = pcb
         else:    
@@ -74,7 +75,7 @@ class IoDeviceController():
         self._currentPCB = None
         return finishedPCB
 
-    #saca lo que esta en espera y lo ejecuta
+    
     def sacarYEjecutar(self):
         if (len(self._waiting_queue) > 0) and self._device.is_idle:
             pair = self._waiting_queue.pop(0)
@@ -121,14 +122,15 @@ class KillInterruptionHandler(AbstractInterruptionHandler):
         log.logger.info(" que hay:{} ".format(irq))
         
 
-        procesosCorriendo = self.kernel.pcbTable.pcbEnRunning()
 
-        if procesosCorriendo != None:
+        if self.kernel.pcbTable.pcbEnRunning() != None:
+            procesosCorriendo = self.kernel.pcbTable.pcbEnRunning()
             procesosCorriendo.state = TERMINATED
             self.kernel.dispatcher.save(procesosCorriendo)
 
-        if len(self.kernel.readyQueve) >= 1:
-            next_pcb = self.kernel.readyQueve.pop(0)
+        if len(self.kernel.schaduler.hayElementosEnReadyQueve()) >= 1:
+
+            next_pcb = self.kernel.schaduler.next()
             self.kernel.dispatcher.load(next_pcb)
         elif self.kernel.pcbTable.todosLosProcesosTerminaron():
             HARDWARE.switchOff()
@@ -145,8 +147,8 @@ class IoInInterruptionHandler(AbstractInterruptionHandler):
 
         self.kernel.ioDeviceController.runOperation(pcbRunning,operation)
 
-        if len(self.kernel.readyQueve) >= 1:
-            next_pcb = self.kernel.readyQueve.pop(0)
+        if len(self.kernel.schaduler.hayElementosEnReadyQueve()) >= 1:
+            next_pcb = self.kernel.schaduler.next()
             self.kernel.dispatcher.load(next_pcb)
 
         log.logger.info(self.kernel.ioDeviceController)
@@ -154,31 +156,34 @@ class IoInInterruptionHandler(AbstractInterruptionHandler):
 class IoOutInterruptionHandler(AbstractInterruptionHandler):
 
     def execute(self, irq):
-        self._kernel.ioDeviceController.sacarYEjecutar()
-
         pcb = self.kernel.ioDeviceController.getFinishedPCB()
-
-        if  self.kernel.pcbTable.todosLosProcesosTerminaron():
-            self.kernel.readyQueve.append(pcb)
-            pcb.state = READY
-        else:
-            self.kernel.dispatcher.load(pcb)
+        self._kernel.ioDeviceController.sacarYEjecutar()
+        self.kernel.schaduler.add(pcb)
         
         log.logger.info(self.kernel.ioDeviceController)
+class HandlerTime(AbstractInterruptionHandler):
+
+    def execute(self, irq):
+        if len(self.kernel.schaduler.hayElementosEnReadyQueve()) >= 1:
+            if self.kernel.pcbTable.pcbEnRunning() != None:
+                pcbCorriendo = self.kernel.pcbTable.pcbEnRunning()
+                self.kernel.schaduler.expropiar(pcbCorriendo)
+                
+        HARDWARE.timer.reset()
+
 class NewHandler(AbstractInterruptionHandler):
 
    def execute(self,irq):
-        program = irq.parameters
+        program = irq.parameters["program"]
+        prioridad = irq.parameters["prioridad"]
   
         baseDir = self._kernel.loader.load(program)
-        pcb = PCB(baseDir,program)
+        pcb = PCB(baseDir,program,prioridad)
         self.kernel.pcbTable.cagarPcb(pcb)
+        
+        self.kernel.schaduler.add(pcb)
 
-        if  self.kernel.pcbTable.pcbEnRunning() != None:
-            self.kernel.readyQueve.append(pcb)
-            pcb.state = READY
-        else:
-            self.kernel.dispatcher.load(pcb)
+       
         log.logger.info("\n Executing program: {name}".format(name=program.name))
         log.logger.info("\n diccionario: {pcbTable}".format(pcbTable=pcb))
         log.logger.info(HARDWARE)
@@ -189,13 +194,18 @@ class Kernel():
     def __init__(self):
         self.loader = Loader()  
         self.pcbTable = PCBTable()
-        self.readyQueve = []
         self.dispatcher = Dispatcher()
+        
+        # self.schaduler = FCFS(self)
+        # self.schaduler = PrioridadNoExpropiativa(self)
+        self.schaduler = PrioridadExpropiativa(self)
+        # self.schaduler = Roundribin(self)
+        # HARDWARE.timer.quantum=3
         
         self.gantt = Gantt(self)
         HARDWARE.clock.addSubscriber(self.gantt)
+        
 
-        ## setup interruption handlers
         killHandler = KillInterruptionHandler(self)
         HARDWARE.interruptVector.register(KILL_INTERRUPTION_TYPE, killHandler)
 
@@ -207,7 +217,10 @@ class Kernel():
 
         newInterruptionHandler = NewHandler(self)
         HARDWARE.interruptVector.register(NEW_INTERRUPTION_TYPE,newInterruptionHandler)
-
+        
+        handlerTime = HandlerTime(self)
+        HARDWARE.interruptVector.register(TIMEOUT_INTERRUPTION_TYPE,handlerTime)
+       
         ## controls the Hardware's I/O Device
         self._ioDeviceController = IoDeviceController(HARDWARE.ioDevice)
              
@@ -223,8 +236,8 @@ class Kernel():
 
 
     ## emulates a "system call" for programs execution
-    def run(self, program):
-        New = IRQ(NEW_INTERRUPTION_TYPE,program)
+    def run(self, program,prioridad):
+        New = IRQ(NEW_INTERRUPTION_TYPE,{"program":program,"prioridad":prioridad})
         HARDWARE.interruptVector.handle(New)
 
 
@@ -243,13 +256,15 @@ class Loader():
         self.indiceDecarga += progSize
         return self.indiceDecarga - progSize
 
+
 class PCB():
-    def __init__(self,base,program):
+    def __init__(self,base,program,prioridad):
         self.baseDir = base
         self.programPath = program.name
         self.pid = 0
         self.pc = 0
         self.state = NEW
+        self.prioridad = prioridad
     def __repr__(self):
         return "pid {} baseDir {} pc {} state {} programPath {}".format(self.pid,self.baseDir,self.pc,self.state,self.programPath)
 
@@ -270,16 +285,15 @@ class PCBTable():
     def pcbEnRunning (self):
         for k,v in  self.procesos.items():
             if v.state == RUNNING:
-                return v
-               
+                return v 
         return None
 
     def todosLosProcesosTerminaron (self):
         for k,v in  self.procesos.items():
-            if v.state == TERMINATED:
-                return True
-            else:   
+            if v.state != TERMINATED:
                 return False
+             
+        return True
                 
     
 class Dispatcher():
@@ -287,6 +301,7 @@ class Dispatcher():
     def load(self, pcb):
         HARDWARE.cpu.pc = pcb.pc
         HARDWARE.mmu.baseDir = pcb.baseDir
+        HARDWARE.timer.reset()
         pcb.state = RUNNING
     
     def save(self, pcb):
@@ -310,4 +325,87 @@ class Gantt():
            
     def __repr__(self):
         return tabulate(enumerate(self._ticks), tablefmt='grid')
+
+class readyQueve():
+    def __init__(self):
+        self.pcbs = []
+    def insert(self,indice,pcb):
+        pcb.state = READY
+        self.pcbs.insert(indice,pcb)
+    def agregar (self,pcb):
+        pcb.state = READY
+        self.pcbs.append(pcb)
+    def sacar (self):
+        return self.pcbs.pop(0)
+
+    def elementosDeLista(self):
+        return self.pcbs
+
+class Schaduler():
     
+    def __init__(self,kernel):
+        self.readyQueve = readyQueve()
+        self.kernel = kernel
+    def add (self):
+        pass
+    def expropiar(self,pcb):
+        pass
+    def next (self):
+        return self.readyQueve.sacar()
+    def hayElementosEnReadyQueve(self):
+        return self.readyQueve.elementosDeLista()
+    def enColarOrdenado(self,pcb):
+        index = 0
+        while index < len(self.readyQueve.pcbs) and self.readyQueve.pcbs[index].prioridad < pcb.prioridad:
+            index = index + 1
+        self.readyQueve.insert(index,pcb)
+
+class FCFS(Schaduler):
+
+    def add (self,pcb):
+        if self.kernel.pcbTable.pcbEnRunning() == None:
+            self.kernel.dispatcher.load(pcb)
+        else:
+            self.readyQueve.agregar(pcb)
+
+
+class PrioridadNoExpropiativa(Schaduler):
+    def add (self,pcb):
+
+        if  self.kernel.pcbTable.pcbEnRunning() == None:
+            self.kernel.dispatcher.load(pcb)
+        else:
+            self.enColarOrdenado(pcb)
+
+class PrioridadExpropiativa(Schaduler):
+
+    def add (self,pcb):
+        if  self.kernel.pcbTable.pcbEnRunning() == None:
+            self.kernel.dispatcher.load(pcb)
+        else:
+            self.expropiar(pcb)
+
+    def expropiar(self,pcb):
+        pcbCorriendo = self.kernel.pcbTable.pcbEnRunning()
+       
+        if(pcb.prioridad < pcbCorriendo.prioridad):
+            self.kernel.dispatcher.save(pcbCorriendo)
+            self.enColarOrdenado(pcbCorriendo)
+            self.kernel.dispatcher.load(pcb)
+        else:
+            self.enColarOrdenado(pcb)
+    
+class Roundribin(Schaduler):
+    def add (self,pcb):
+        if self.kernel.pcbTable.pcbEnRunning() == None:
+            self.kernel.dispatcher.load(pcb)
+        else:
+            self.readyQueve.agregar(pcb)
+    def expropiar(self,pcb):
+        if len(self.kernel.schaduler.hayElementosEnReadyQueve()) >= 1:
+            if self.kernel.pcbTable.pcbEnRunning() != None:
+                pcbCorriendo = self.kernel.pcbTable.pcbEnRunning()
+                self.kernel.dispatcher.save(pcbCorriendo)
+                self.add(pcbCorriendo)
+                elSiguinete = self.next()
+                self.kernel.dispatcher.load(elSiguinete)
